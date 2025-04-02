@@ -3,6 +3,10 @@ import os
 import subprocess
 import time
 import shutil
+import threading
+import json
+import matplotlib.pyplot as plt
+import pandas as pd
 
 # Pre-define GPU environment variables
 gpu_env = {
@@ -10,14 +14,14 @@ gpu_env = {
     "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
     "MANIMGL_ENABLE_GPU": "1",
     "MANIMGL_MULTIPROCESSING": "0",
-    "LD_LIBRARY_PATH": "/usr/lib/x86_64-linux-gnu:/usr/lib/i386-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
+    "LD_LIBRARY_PATH": "/usr/lib/x86_64-linux-gnu:/usr/lib/i386-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64",
 }
 
 # Pre-define CPU environment variables
 cpu_env = {
     "MANIMGL_ENABLE_GPU": "0",
     "MANIMGL_MULTIPROCESSING": "1",
-    "LD_LIBRARY_PATH": "/usr/lib/x86_64-linux-gnu:/usr/lib/i386-linux-gnu"
+    "LD_LIBRARY_PATH": "/usr/lib/x86_64-linux-gnu:/usr/lib/i386-linux-gnu",
 }
 
 image = (
@@ -69,16 +73,60 @@ image = (
         "mapbox-earcut",
         "validators",
         "tqdm",
+        "pandas",
+        "matplotlib",  # Add matplotlib for visualization
     )
-    .add_local_dir(
-        ".",
-        remote_path="/root/local"
-    )
+    .add_local_dir(".", remote_path="/root/local")
 )
 
 app = modal.App("manim-gpu-benchmark", image=image)
 
 volume = modal.Volume.from_name("manim-outputs", create_if_missing=True)
+
+
+def monitor_gpu(output_file, stop_event, interval=1.0):
+    timestamp_start = time.time()
+    gpu_stats = []
+
+    print(f"Starting GPU monitoring, saving to {output_file}")
+
+    while not stop_event.is_set():
+        nvidia_smi = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.total,memory.used,memory.free,temperature.gpu,power.draw",
+                "--format=csv,noheader,nounits",
+            ],
+            text=True,
+        )
+
+        for line in nvidia_smi.strip().split("\n"):
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) >= 9:
+                relative_time = time.time() - timestamp_start
+                stats = {
+                    "timestamp": parts[0],
+                    "relative_time": relative_time,
+                    "gpu_index": parts[1],
+                    "gpu_utilization": parts[2],
+                    "memory_utilization": parts[3],
+                    "memory_total": parts[4],
+                    "memory_used": parts[5],
+                    "memory_free": parts[6],
+                    "temperature": parts[7],
+                    "power_draw": parts[8],
+                }
+                gpu_stats.append(stats)
+                print(
+                    f"GPU stats: Util={stats['gpu_utilization']}%, Mem={stats['memory_used']}/{stats['memory_total']}MB, Temp={stats['temperature']}°C"
+                )
+
+        time.sleep(interval)
+
+    with open(output_file, "w") as f:
+        json.dump(gpu_stats, f, indent=2)
+
+    print(f"GPU monitoring complete, saved {len(gpu_stats)} samples to {output_file}")
 
 
 @app.function(
@@ -95,30 +143,26 @@ def render_manim_gpu(scene_name="SimpleAnimation"):
     print(f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES')}")
     print(f"MANIMGL_ENABLE_GPU: {os.environ.get('MANIMGL_ENABLE_GPU')}")
     print(f"LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH')}")
-
-    # Verify GPU availability
     nvidia_info = subprocess.check_output(["nvidia-smi"], text=True)
     print(f"NVIDIA-SMI Output:\n{nvidia_info}")
-
-    # Clean output directory
     subprocess.run(["rm -rf /root/output/gpu/*"], shell=True)
     output_path = "/root/output/gpu"
     os.makedirs(output_path, exist_ok=True)
+    monitoring_output = os.path.join(output_path, f"{scene_name}_GPU_monitoring.json")
+    stop_monitoring = threading.Event()
+    monitor_thread = threading.Thread(
+        target=monitor_gpu,
+        args=(monitoring_output, stop_monitoring, 2),
+    )
 
     print("Running on GPU...")
-
-    # Setup virtual display
     os.environ["DISPLAY"] = ":1"
     display_process = subprocess.Popen(["Xvfb", ":1", "-screen", "0", "1920x1080x24"])
     time.sleep(2)
-
-    # Start timing
+    monitor_thread.start()
+    print("GPU monitoring started")
     start_time = time.time()
-
-    # Run command, ensuring all environment variables are passed
     cmd = "cd /root/local && "
-
-    # Add all environment variables to command
     for key, value in gpu_env.items():
         cmd += f"{key}={value} "
 
@@ -128,14 +172,20 @@ def render_manim_gpu(scene_name="SimpleAnimation"):
     print(f"Running command on GPU: {cmd}")
 
     # Execute command
-    process = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=os.environ)
+    process = subprocess.run(
+        cmd, shell=True, capture_output=True, text=True, env=os.environ
+    )
     print(f"Exit code: {process.returncode}")
     print(f"STDOUT: {process.stdout}")
     print(f"STDERR: {process.stderr}")
     elapsed_time = time.time() - start_time
+
+    # 停止GPU监控
+    stop_monitoring.set()
+    monitor_thread.join()
+    print("GPU monitoring stopped")
+
     display_process.terminate()
-
-
 
     found_mp4_files = []
     search_dirs = ["/root/local", "/root/local/videos", "/root"]
@@ -154,7 +204,10 @@ def render_manim_gpu(scene_name="SimpleAnimation"):
             "device": "GPU",
             "elapsed_time": elapsed_time,
             "output_files": [],
-            "exit_code": process.returncode
+            "exit_code": process.returncode,
+            "monitoring_file": monitoring_output
+            if os.path.exists(monitoring_output)
+            else None,
         }
 
     # Get output directory
@@ -167,7 +220,11 @@ def render_manim_gpu(scene_name="SimpleAnimation"):
         for file in os.listdir(manim_output_dir):
             if file.endswith(".mp4") or file.endswith(".wav"):
                 src_path = os.path.join(manim_output_dir, file)
-                dst_filename = f"{scene_name}_GPU.mp4" if file.endswith(".mp4") else f"{scene_name}_GPU.wav"
+                dst_filename = (
+                    f"{scene_name}_GPU.mp4"
+                    if file.endswith(".mp4")
+                    else f"{scene_name}_GPU.wav"
+                )
                 dst_path = os.path.join(output_path, dst_filename)
                 print(f"Copying {src_path} to {dst_path}")
                 shutil.copy2(src_path, dst_path)
@@ -179,17 +236,23 @@ def render_manim_gpu(scene_name="SimpleAnimation"):
             file_path = os.path.join(root, file)
             rel_path = os.path.relpath(file_path, output_path)
             size_bytes = os.path.getsize(file_path)
-            output_files.append({
-                "path": rel_path,
-                "size": size_bytes,
-                "full_path": file_path
-            })
+            output_files.append(
+                {"path": rel_path, "size": size_bytes, "full_path": file_path}
+            )
+
+    # 添加GPU监控文件到结果
+    monitoring_rel_path = (
+        os.path.relpath(monitoring_output, output_path)
+        if os.path.exists(monitoring_output)
+        else None
+    )
 
     return {
         "device": "GPU",
         "elapsed_time": elapsed_time,
         "output_files": output_files,
-        "exit_code": process.returncode
+        "exit_code": process.returncode,
+        "monitoring_file": monitoring_rel_path,
     }
 
 
@@ -223,13 +286,14 @@ def render_manim_cpu(scene_name="SimpleAnimation"):
     cmd += f"manimgl binary_search.py {scene_name} -o"
     print(f"Running command on CPU: {cmd}")
 
-    process = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=os.environ)
+    process = subprocess.run(
+        cmd, shell=True, capture_output=True, text=True, env=os.environ
+    )
     print(f"Exit code: {process.returncode}")
     print(f"STDOUT: {process.stdout}")
     print(f"STDERR: {process.stderr}")
     elapsed_time = time.time() - start_time
     display_process.terminate()
-
 
     found_mp4_files = []
     search_dirs = ["/root/local", "/root/local/videos", "/root"]
@@ -248,7 +312,7 @@ def render_manim_cpu(scene_name="SimpleAnimation"):
             "device": "CPU",
             "elapsed_time": elapsed_time,
             "output_files": [],
-            "exit_code": process.returncode
+            "exit_code": process.returncode,
         }
     manim_output_dir = os.path.dirname(found_mp4_files[0])
 
@@ -259,7 +323,11 @@ def render_manim_cpu(scene_name="SimpleAnimation"):
         for file in os.listdir(manim_output_dir):
             if file.endswith(".mp4") or file.endswith(".wav"):
                 src_path = os.path.join(manim_output_dir, file)
-                dst_filename = f"{scene_name}_CPU.mp4" if file.endswith(".mp4") else f"{scene_name}_CPU.wav"
+                dst_filename = (
+                    f"{scene_name}_CPU.mp4"
+                    if file.endswith(".mp4")
+                    else f"{scene_name}_CPU.wav"
+                )
                 dst_path = os.path.join(output_path, dst_filename)
                 print(f"Copying {src_path} to {dst_path}")
                 shutil.copy2(src_path, dst_path)
@@ -271,18 +339,145 @@ def render_manim_cpu(scene_name="SimpleAnimation"):
             file_path = os.path.join(root, file)
             rel_path = os.path.relpath(file_path, output_path)
             size_bytes = os.path.getsize(file_path)
-            output_files.append({
-                "path": rel_path,
-                "size": size_bytes,
-                "full_path": file_path
-            })
+            output_files.append(
+                {"path": rel_path, "size": size_bytes, "full_path": file_path}
+            )
 
     return {
         "device": "CPU",
         "elapsed_time": elapsed_time,
         "output_files": output_files,
-        "exit_code": process.returncode
+        "exit_code": process.returncode,
     }
+
+
+# 修改后的函数：生成GPU内存使用的报告和可视化
+@app.function(
+    volumes={"/root/output": volume},
+)
+def generate_gpu_monitoring_report(monitoring_file_path):
+    """生成GPU监控报告，专注于显存占用情况可视化"""
+    if not os.path.exists(monitoring_file_path):
+        print(f"Monitoring file not found: {monitoring_file_path}")
+        return None
+
+    try:
+        with open(monitoring_file_path, "r") as f:
+            monitoring_data = json.load(f)
+
+        if not monitoring_data:
+            print("No GPU monitoring data found")
+            return None
+
+        # 计算平均值和最大值
+        gpu_util_values = [float(entry["gpu_utilization"]) for entry in monitoring_data]
+        mem_util_values = [float(entry["memory_utilization"]) for entry in monitoring_data]
+        mem_used_values = [float(entry["memory_used"]) for entry in monitoring_data]
+        mem_total_values = [float(entry["memory_total"]) for entry in monitoring_data]
+        mem_free_values = [float(entry["memory_free"]) for entry in monitoring_data]
+        relative_times = [float(entry["relative_time"]) for entry in monitoring_data]
+
+        report = {
+            "samples_count": len(monitoring_data),
+            "duration_seconds": monitoring_data[-1]["relative_time"] - monitoring_data[0]["relative_time"]
+            if len(monitoring_data) > 1
+            else 0,
+            "gpu_utilization": {
+                "avg": sum(gpu_util_values) / len(gpu_util_values) if gpu_util_values else 0,
+                "max": max(gpu_util_values) if gpu_util_values else 0,
+                "min": min(gpu_util_values) if gpu_util_values else 0,
+            },
+            "memory_utilization": {
+                "avg": sum(mem_util_values) / len(mem_util_values) if mem_util_values else 0,
+                "max": max(mem_util_values) if mem_util_values else 0,
+                "min": min(mem_util_values) if mem_util_values else 0,
+            },
+            "memory_used_mb": {
+                "avg": sum(mem_used_values) / len(mem_used_values) if mem_used_values else 0,
+                "max": max(mem_used_values) if mem_used_values else 0,
+                "min": min(mem_used_values) if mem_used_values else 0,
+            },
+            "memory_total_mb": {
+                "value": sum(mem_total_values) / len(mem_total_values) if mem_total_values else 0,
+            },
+            "memory_free_mb": {
+                "avg": sum(mem_free_values) / len(mem_free_values) if mem_free_values else 0,
+                "min": min(mem_free_values) if mem_free_values else 0,
+            },
+        }
+
+        # 创建简单的CSV报告
+        report_dir = os.path.dirname(monitoring_file_path)
+        report_path = os.path.join(report_dir, "gpu_monitoring_report.csv")
+
+        with open(report_path, "w") as f:
+            f.write("Metric,Average,Maximum,Minimum\n")
+            f.write(
+                f"GPU Utilization (%),{report['gpu_utilization']['avg']:.2f},{report['gpu_utilization']['max']:.2f},{report['gpu_utilization']['min']:.2f}\n")
+            f.write(
+                f"Memory Utilization (%),{report['memory_utilization']['avg']:.2f},{report['memory_utilization']['max']:.2f},{report['memory_utilization']['min']:.2f}\n")
+            f.write(
+                f"Memory Used (MB),{report['memory_used_mb']['avg']:.2f},{report['memory_used_mb']['max']:.2f},{report['memory_used_mb']['min']:.2f}\n")
+            f.write(
+                f"Memory Free (MB),{report['memory_free_mb']['avg']:.2f},N/A,{report['memory_free_mb']['min']:.2f}\n")
+            f.write(f"Memory Total (MB),{report['memory_total_mb']['value']:.2f},N/A,N/A\n")
+            f.write(f"\nSamples Count,{report['samples_count']}\n")
+            f.write(f"Duration (seconds),{report['duration_seconds']:.2f}\n")
+
+        # 创建内存使用可视化图表
+        # 创建DataFrame进行数据处理和可视化
+        df = pd.DataFrame({
+            'Time (s)': relative_times,
+            'Memory Used (MB)': mem_used_values,
+            'Memory Free (MB)': mem_free_values,
+            'Memory Utilization (%)': mem_util_values,
+            'GPU Utilization (%)': gpu_util_values
+        })
+
+        # 绘制内存使用随时间变化的图表
+        plt.figure(figsize=(12, 10))
+
+        # 1. 内存使用图 (显存占用MB)
+        plt.subplot(2, 1, 1)
+        plt.plot(df['Time (s)'], df['Memory Used (MB)'], 'b-', linewidth=2, label='Memory Used (MB)')
+        plt.plot(df['Time (s)'], df['Memory Free (MB)'], 'g-', linewidth=2, label='Memory Free (MB)')
+        plt.axhline(y=float(mem_total_values[0]), color='r', linestyle='--', linewidth=1,
+                    label=f'Total Memory: {mem_total_values[0]} MB')
+        plt.fill_between(df['Time (s)'], df['Memory Used (MB)'], alpha=0.3, color='blue')
+        plt.xlabel('Time (seconds)')
+        plt.ylabel('Memory (MB)')
+        plt.title('GPU Memory Usage Over Time')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend()
+
+        # 2. 内存和GPU利用率图
+        plt.subplot(2, 1, 2)
+        plt.plot(df['Time (s)'], df['Memory Utilization (%)'], 'b-', linewidth=2, label='Memory Utilization (%)')
+        plt.plot(df['Time (s)'], df['GPU Utilization (%)'], 'r-', linewidth=2, label='GPU Utilization (%)')
+        plt.fill_between(df['Time (s)'], df['Memory Utilization (%)'], alpha=0.3, color='blue')
+        plt.xlabel('Time (seconds)')
+        plt.ylabel('Utilization (%)')
+        plt.title('GPU and Memory Utilization Over Time')
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.legend()
+
+        plt.tight_layout()
+
+        # 保存图表
+        chart_path = os.path.join(report_dir, "gpu_memory_usage_chart.png")
+        plt.savefig(chart_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        print(f"GPU monitoring report generated: {report_path}")
+        print(f"GPU memory usage chart generated: {chart_path}")
+
+        return report
+
+    except Exception as e:
+        print(f"Error generating GPU monitoring report: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 @app.function(
@@ -332,8 +527,24 @@ def main():
     print(f"GPU rendering time: {gpu_result['elapsed_time']:.2f} seconds")
     print(f"Exit code: {gpu_result['exit_code']}")
     print(f"Generated {len(gpu_result['output_files'])} output files")
-    for file_info in gpu_result['output_files']:
+    for file_info in gpu_result["output_files"]:
         print(f"- {file_info['path']} ({file_info['size'] / 1024 / 1024:.2f} MB)")
+
+    # 处理GPU监控数据
+    if "monitoring_file" in gpu_result and gpu_result["monitoring_file"]:
+        print("\n=== Generating GPU Monitoring Report ===")
+        monitoring_file_path = os.path.join(f"/root/output/gpu", gpu_result["monitoring_file"])
+        monitoring_report = generate_gpu_monitoring_report.remote(monitoring_file_path)
+
+        if monitoring_report:
+            print("\n=== GPU Memory Usage Stats ===")
+            print(f"Total Memory: {monitoring_report['memory_total_mb']['value']:.2f} MB")
+            print(
+                f"Average Memory Usage: {monitoring_report['memory_used_mb']['avg']:.2f} MB ({monitoring_report['memory_utilization']['avg']:.2f}%)")
+            print(
+                f"Maximum Memory Usage: {monitoring_report['memory_used_mb']['max']:.2f} MB ({monitoring_report['memory_utilization']['max']:.2f}%)")
+            print(f"Minimum Free Memory: {monitoring_report['memory_free_mb']['min']:.2f} MB")
+            print(f"Average GPU Utilization: {monitoring_report['gpu_utilization']['avg']:.2f}%")
 
     print("\n=== Running ManimGL on CPU ===")
 
@@ -346,13 +557,13 @@ def main():
     print(f"Exit code: {cpu_result['exit_code']}")
     print(f"Generated {len(cpu_result['output_files'])} output files")
 
-    for file_info in cpu_result['output_files']:
+    for file_info in cpu_result["output_files"]:
         print(f"- {file_info['path']} ({file_info['size'] / 1024 / 1024:.2f} MB)")
 
     print("\n=== GPU vs CPU Performance Comparison ===")
     if gpu_result and cpu_result:
-        gpu_render_time = gpu_result['elapsed_time']
-        cpu_render_time = cpu_result['elapsed_time']
+        gpu_render_time = gpu_result["elapsed_time"]
+        cpu_render_time = cpu_result["elapsed_time"]
 
         if gpu_render_time > 0:
             speedup = cpu_render_time / gpu_render_time
@@ -372,12 +583,12 @@ def main():
             device_dir = os.path.join(local_output_dir, device.lower())
             os.makedirs(device_dir, exist_ok=True)
 
-            for file_info in result['output_files']:
-                if file_info['path'].endswith('.mp4') or file_info['path'].endswith('.wav'):
+            for file_info in result["output_files"]:
+                if file_info["path"].endswith(".mp4") or file_info["path"].endswith(".wav"):
                     print(f"Downloading {device} file: {file_info['path']}...")
-                    content = download_file.remote(file_info['full_path'])
+                    content = download_file.remote(file_info["full_path"])
                     if content is not None:
-                        local_file_path = os.path.join(device_dir, file_info['path'])
+                        local_file_path = os.path.join(device_dir, file_info["path"])
                         os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
                         with open(local_file_path, "wb") as f:
                             f.write(content)
@@ -385,10 +596,53 @@ def main():
                     else:
                         print(f"❌ Failed to download {file_info['path']}")
 
+            if device == "GPU" and "monitoring_file" in result and result["monitoring_file"]:
+                print(f"Downloading GPU monitoring data...")
+
+                monitoring_path = os.path.join(f"/root/output/{device.lower()}", result["monitoring_file"])
+                monitoring_content = download_file.remote(monitoring_path)
+                if monitoring_content is not None:
+                    local_monitoring_path = os.path.join(device_dir, result["monitoring_file"])
+                    with open(local_monitoring_path, "wb") as f:
+                        f.write(monitoring_content)
+                    print(f"✅ Downloaded monitoring data to {local_monitoring_path}")
+
+                # 下载GPU内存使用报告和图表
+                report_path = os.path.join(f"/root/output/{device.lower()}", "gpu_monitoring_report.csv")
+                report_content = download_file.remote(report_path)
+                if report_content is not None:
+                    local_report_path = os.path.join(device_dir, "gpu_monitoring_report.csv")
+                    with open(local_report_path, "wb") as f:
+                        f.write(report_content)
+                    print(f"✅ Downloaded monitoring report to {local_report_path}")
+
+                # 下载GPU内存使用图表
+                chart_path = os.path.join(f"/root/output/{device.lower()}", "gpu_memory_usage_chart.png")
+                chart_content = download_file.remote(chart_path)
+                if chart_content is not None:
+                    local_chart_path = os.path.join(device_dir, "gpu_memory_usage_chart.png")
+                    with open(local_chart_path, "wb") as f:
+                        f.write(chart_content)
+                    print(f"✅ Downloaded memory usage chart to {local_chart_path}")
+
         print(f"\nAll files downloaded to {local_output_dir}")
         print("\n=== FINAL PERFORMANCE REPORT ===")
         print(f"GPU rendering time: {gpu_render_time:.2f} seconds")
         print(f"CPU rendering time: {cpu_render_time:.2f} seconds")
         print(f"Performance gain: GPU is {speedup:.2f}x faster than CPU")
+        if "monitoring_file" in gpu_result and gpu_result["monitoring_file"]:
+            print("\n=== GPU MEMORY USAGE SUMMARY ===")
+            monitoring_report = generate_gpu_monitoring_report.remote(
+                os.path.join(f"/root/output/gpu", gpu_result["monitoring_file"])
+            )
+            if monitoring_report:
+                print(f"Samples collected: {monitoring_report['samples_count']}")
+                print(f"Total Memory: {monitoring_report['memory_total_mb']['value']:.2f} MB")
+                print(
+                    f"Memory Usage: Avg={monitoring_report['memory_used_mb']['avg']:.2f}MB ({monitoring_report['memory_utilization']['avg']:.2f}%), Max={monitoring_report['memory_used_mb']['max']:.2f}MB ({monitoring_report['memory_utilization']['max']:.2f}%)")
+                print(f"Memory Free: Min={monitoring_report['memory_free_mb']['min']:.2f}MB")
+                print(
+                    f"GPU Utilization: Avg={monitoring_report['gpu_utilization']['avg']:.2f}%, Max={monitoring_report['gpu_utilization']['max']:.2f}%")
+                print("\nA visualization of the GPU memory usage has been generated as 'gpu_memory_usage_chart.png'")
     else:
         print("Cannot compare performance as at least one of the runs failed.")
