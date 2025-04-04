@@ -51,7 +51,7 @@ image = (
         "texlive-fonts-recommended",
     )
     .pip_install(
-        "manim",  # Specify exact version
+        "manim",
         "numpy",
         "manimpango",
         "requests",
@@ -71,9 +71,9 @@ image = (
     .add_local_dir(".", remote_path="/root/local")
 )
 
-app = modal.App("manim-direct-parallel-rendering", image=image)
+app = modal.App("manim-multi-class-rendering", image=image)
 # Create a single shared volume for all files
-volume = modal.Volume.from_name("manim-outputs-parallel", create_if_missing=True)
+volume = modal.Volume.from_name("manim-outputs-multi-class", create_if_missing=True)
 
 # Helper function to check for videos and list directories
 def list_directory_contents(path, depth=0, max_depth=3):
@@ -96,146 +96,30 @@ def list_directory_contents(path, depth=0, max_depth=3):
     
     return result
 
-def generate_segment_script(original_script_path, scene_name, segment_config):
-    """
-    Generate a modified Manim script that will only render a specific segment of the animation.
-    """
-    start_frame = segment_config["start_frame"]
-    end_frame = segment_config["end_frame"]
-    segment_id = segment_config["segment_id"]
-    
-    # Read the original script
-    with open(original_script_path, "r") as f:
-        script_content = f.read()
-    
-    # Create a segment-specific script with more accurate frame tracking
-    segment_script = f"""
-# Modified script for segment {segment_id} (frames {start_frame}-{end_frame})
-import sys
-import math
-from manim import *
-
-# Original script content
-{script_content}
-
-# Create a segment-specific scene that inherits from the original
-class Segment{segment_id}({scene_name}):
-    def construct(self):
-        # Store the original play method
-        original_play = self.play
-        
-        # Initialize frame tracking
-        self.current_frame = 0
-        self.segment_start = {start_frame}
-        self.segment_end = {end_frame}
-        
-        def modified_play(self, *animations, **kwargs):
-            # Get the run time for this animation
-            run_time = kwargs.get('run_time', 1)
-            anim_frames = math.ceil(run_time * config.frame_rate)
-            
-            # Determine if this animation is in our segment
-            if self.current_frame + anim_frames <= self.segment_start:
-                # Skip this animation - it's before our segment
-                self.current_frame += anim_frames
-                return self
-            
-            if self.current_frame >= self.segment_end:
-                # Skip this animation - it's after our segment
-                return self
-            
-            # Animation is at least partially in our segment - play it
-            result = original_play(*animations, **kwargs)
-            self.current_frame += anim_frames
-            return result
-        
-        # Replace the play method
-        self.play = modified_play.__get__(self, type(self))
-        
-        # Run the original construct method with our modified play
-        super().construct()
-        
-        # Restore the original play method
-        self.play = original_play
-
-if __name__ == "__main__":
-    # Use standard resolution and frame rate
-    config.pixel_height = 720
-    config.pixel_width = 1280
-    config.frame_rate = 30
-    Segment{segment_id}().render()
-"""
-
-    # Write the modified script to a temporary file
-    segment_script_path = f"/tmp/segment_{segment_id}.py"
-    with open(segment_script_path, "w") as f:
-        f.write(segment_script)
-    
-    return segment_script_path
-
-def get_animation_metadata(script_path, scene_name):
-    """Get metadata about the animation to determine how to split it"""
-    # Check for operating system
-    import platform
-    is_windows = platform.system() == "Windows"
-    
-    display_process = None
-    try:
-        # Set up virtual display (only on Linux/Unix)
-        if not is_windows:
-            os.environ["DISPLAY"] = ":1"
-            display_process = subprocess.Popen(["Xvfb", ":1", "-screen", "0", "1920x1080x24"])
-            time.sleep(2)
-        
-        # Run manim with --dry_run flag to get animation info
-        cmd = f"cd {os.path.dirname(script_path)} && manim --dry_run {os.path.basename(script_path)} {scene_name}"
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-        
-        # Parse the output to get animation duration and frames
-        output = result.stdout + result.stderr
-        print(f"Dry run output: {output}")
-        
-        # Default values if parsing fails
-        total_frames = 300  # About 10 seconds at 30fps
-        total_duration = 10
-        frame_rate = 30
-        
-        # Try to parse the output
-        for line in output.split('\n'):
-            if "animations" in line.lower() and "frames" in line.lower():
-                # Example: "Total: 10 animations, 300 frames"
-                parts = line.split(',')
-                if len(parts) >= 2:
-                    frames_part = parts[1].strip()
-                    frames_str = ''.join(filter(str.isdigit, frames_part))
-                    if frames_str:
-                        total_frames = int(frames_str)
-                        break
-            
-        # Calculate total duration assuming 30fps
-        total_duration = total_frames / frame_rate
-        
-        return {
-            "total_frames": total_frames,
-            "total_duration": total_duration,
-            "frame_rate": frame_rate
-        }
-    finally:
-        if display_process:
-            display_process.terminate()
-
 # Function to upload a script to the Modal environment
 @app.function(volumes={"/root/shared": volume})
 def upload_script(script_content, script_name):
-    """Upload a script to the shared volume"""
+    """Upload a script to the shared volume with better error handling"""
     script_path = f"/root/shared/{script_name}"
     os.makedirs(os.path.dirname(script_path), exist_ok=True)
     
     with open(script_path, "w") as f:
         f.write(script_content)
     
-    print(f"Script uploaded to: {script_path}")
-    return script_path
+    # Verify the file was actually written
+    if os.path.exists(script_path):
+        file_size = os.path.getsize(script_path)
+        print(f"Script uploaded to: {script_path} ({file_size} bytes)")
+        
+        # For debugging, show the first few lines
+        with open(script_path, "r") as f:
+            head = "".join(f.readlines()[:5])
+        print(f"File starts with: {head}")
+        
+        return script_path
+    else:
+        print(f"ERROR: Failed to upload script to {script_path}")
+        return None
 
 # Function to check if a file exists and copy from local if needed
 @app.function(volumes={"/root/shared": volume})
@@ -277,6 +161,38 @@ def check_and_fix_script_path(script_path):
     
     return None
 
+def generate_class_render_script(original_script_path, class_name):
+    """
+    Generate a modified Manim script that will only render a specific animation class.
+    """
+    # Read the original script
+    with open(original_script_path, "r") as f:
+        script_content = f.read()
+    
+    # Create a class-specific script
+    class_script = f"""
+# Modified script to render only the {class_name} class
+import sys
+from manim import *
+
+# Original script content
+{script_content}
+
+if __name__ == "__main__":
+    # Use standard resolution and frame rate
+    config.pixel_height = 720
+    config.pixel_width = 1280
+    config.frame_rate = 30
+    {class_name}().render()
+"""
+
+    # Write the modified script to a temporary file
+    class_script_path = f"/tmp/{class_name}_render.py"
+    with open(class_script_path, "w") as f:
+        f.write(class_script)
+    
+    return class_script_path
+
 @app.function(
     volumes={"/root/shared": volume},
     timeout=1200,
@@ -284,12 +200,8 @@ def check_and_fix_script_path(script_path):
     cpu=4 if os.environ.get("USE_GPU", "0") == "0" else 2,
     memory=8192 if os.environ.get("USE_GPU", "0") == "0" else 4096,
 )
-def render_animation_segment(script_path, scene_name, segment_config):
-    """Render a specific segment of the animation directly using Manim"""
-    segment_id = segment_config["segment_id"]
-    start_frame = segment_config["start_frame"]
-    end_frame = segment_config["end_frame"]
-    
+def render_animation_class(script_path, class_name):
+    """Render a specific animation class using Manim"""
     # Set up environment variables based on hardware
     has_gpu = os.environ.get("MODAL_CONTAINER_GPU_COUNT", "0") != "0"
     env_vars = gpu_env if has_gpu else cpu_env
@@ -297,7 +209,7 @@ def render_animation_segment(script_path, scene_name, segment_config):
         os.environ[key] = value
     
     # Configure output paths
-    output_dir = f"/root/shared/output/segment_{segment_id}"
+    output_dir = f"/root/shared/output/class_{class_name}"
     os.makedirs(output_dir, exist_ok=True)
     
     # Set up virtual display
@@ -306,16 +218,16 @@ def render_animation_segment(script_path, scene_name, segment_config):
     time.sleep(2)
     
     try:
-        # Generate a modified script for this segment
-        segment_script_path = generate_segment_script(script_path, scene_name, segment_config)
-        print(f"Generated segment script at: {segment_script_path}")
+        # Generate a modified script for this class
+        class_script_path = generate_class_render_script(script_path, class_name)
+        print(f"Generated class script at: {class_script_path}")
         
-        # Render the segment
+        # Render the class
         start_time = time.time()
-        output_path = f"{output_dir}/segment_{segment_id}.mp4"
+        output_path = f"{output_dir}/{class_name}.mp4"
         
         # Run the script directly with Python
-        cmd = f"python {segment_script_path}"
+        cmd = f"python {class_script_path}"
         print(f"Running command: {cmd}")
         
         process = subprocess.run(cmd, shell=True, capture_output=True, text=True)
@@ -326,31 +238,31 @@ def render_animation_segment(script_path, scene_name, segment_config):
         
         # Find the rendered output file
         found_mp4_files = []
-        search_dirs = ["/tmp", "./media", os.path.dirname(segment_script_path)]
+        search_dirs = ["/tmp", "./media", os.path.dirname(class_script_path)]
         
         for search_dir in search_dirs:
             if os.path.exists(search_dir):
                 for root, dirs, files in os.walk(search_dir):
                     for file in files:
-                        if file.endswith(".mp4") and f"Segment{segment_id}" in file:
+                        if file.endswith(".mp4") and class_name in file:
                             found_mp4_files.append(os.path.join(root, file))
         
         if found_mp4_files:
             # Copy to output location
-            segment_output_path = os.path.join(output_dir, f"segment_{segment_id}.mp4")
-            shutil.copy2(found_mp4_files[0], segment_output_path)
-            print(f"Copied segment {segment_id} to {segment_output_path}")
+            class_output_path = os.path.join(output_dir, f"{class_name}.mp4")
+            shutil.copy2(found_mp4_files[0], class_output_path)
+            print(f"Copied {class_name} to {class_output_path}")
             
             return {
-                "segment_id": segment_id,
+                "class_name": class_name,
                 "success": True,
                 "render_time": render_time,
-                "output_file": segment_output_path,
+                "output_file": class_output_path,
             }
         else:
-            print(f"No output file found for segment {segment_id}")
+            print(f"No output file found for class {class_name}")
             return {
-                "segment_id": segment_id,
+                "class_name": class_name,
                 "success": False,
                 "render_time": render_time,
                 "output_file": None,
@@ -361,122 +273,37 @@ def render_animation_segment(script_path, scene_name, segment_config):
         if display_process:
             display_process.terminate()
 
-
-@app.function(
-    volumes={"/root/shared": volume},
-    timeout=600,
-    cpu=4,
-    memory=8192,
-)
-def combine_segments(segment_paths, output_filename):
-    """Combine all rendered segments into a final video using ffmpeg with appropriate settings"""
-    print(f"Combining segments from paths: {segment_paths}")
-    
-    if not segment_paths:
-        print("Error: No segment paths provided!")
-        return {
-            "success": False,
-            "output_file": None,
-            "reason": "No segment paths provided"
-        }
-    
-    # Sort the segment paths by segment ID to ensure correct order
-    segment_paths.sort(key=lambda x: int(x.split('segment_')[1].split('/')[0]))
-    
-    # Create a temporary directory for intermediate files
-    temp_dir = "/tmp/merge_temp"
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    # Create a file list for ffmpeg
-    concat_file = f"{temp_dir}/concat_list.txt"
-    with open(concat_file, "w") as f:
-        for path in segment_paths:
-            if os.path.exists(path):
-                f.write(f"file '{path}'\n")
-    
-    # Output path for combined video
-    output_path = f"/root/shared/output/{output_filename}"
-    
-    # Verify concat file contents
-    with open(concat_file, "r") as f:
-        print(f"Concat file contents:\n{f.read()}")
-    
-    # Use ffmpeg to concatenate videos with precise frame handling
-    # cmd = f"ffmpeg -f concat -safe 0 -i {concat_file} -c copy {output_path}"
-    # Use re-encoding to ensure frame consistency
-    cmd = f"ffmpeg -f concat -safe 0 -i {concat_file} -c:v libx264 -preset medium -crf 22 {output_path}"
-    
-    print(f"Running command: {cmd}")
-    process = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    
-    success = process.returncode == 0
-    if success:
-        print(f"Successfully combined segments into: {output_path}")
-    else:
-        print(f"Failed to combine segments: {process.stderr}")
-    
-    return {
-        "success": success,
-        "output_file": output_path if success else None,
-        "segments_count": len(segment_paths),
-        "stdout": process.stdout,
-        "stderr": process.stderr
-    }
-
-@app.function(
-    volumes={"/root/shared": volume},
-)
-def download_file(file_path):
-    """Download a file from the volume to the local machine"""
-    print(f"Attempting to download {file_path}")
-    
-    if os.path.exists(file_path):
-        print(f"File size: {os.path.getsize(file_path)} bytes")
-        with open(file_path, "rb") as f:
-            content = f.read()
-            print(f"Read {len(content)} bytes")
-            return content
-    else:
-        print(f"ERROR: File {file_path} does not exist")
-        parent_dir = os.path.dirname(file_path)
-        if os.path.exists(parent_dir):
-            contents = list_directory_contents(parent_dir)
-            print(f"Contents of {parent_dir}:")
-            for line in contents:
-                print(line)
-        else:
-            print(f"Parent directory {parent_dir} does not exist")
-        return None
-
-# MOVED FUNCTIONS TO GLOBAL SCOPE
 @app.function(volumes={"/root/shared": volume})
-def find_segment_files():
-    valid_segment_paths = []
+def find_class_files():
+    """Find all rendered class files in the output directory - improved version"""
+    valid_class_paths = []
     volume_base = "/root/shared/output"
     
-    # List all segment directories
-    if os.path.exists(volume_base):
-        print(f"Scanning directories in {volume_base}:")
-        for segment_dir in sorted(os.listdir(volume_base)):
-            if segment_dir.startswith("segment_"):
-                segment_path = os.path.join(volume_base, segment_dir)
-                print(f"Checking directory: {segment_path}")
-                
-                # Find all MP4 files in this directory and its subdirectories
-                for root, dirs, files in os.walk(segment_path):
-                    for file in files:
-                        if file.endswith(".mp4"):
-                            full_path = os.path.join(root, file)
-                            print(f"Found MP4: {full_path} ({os.path.getsize(full_path)} bytes)")
-                            valid_segment_paths.append(full_path)
-    else:
+    # Make sure the directory exists
+    if not os.path.exists(volume_base):
         print(f"Volume base directory {volume_base} does not exist")
+        return valid_class_paths
     
-    return valid_segment_paths
+    print(f"Scanning all directories under {volume_base} for MP4 files:")
+    
+    # Walk through all directories and subdirectories
+    for root, dirs, files in os.walk(volume_base):
+        for file in files:
+            if file.endswith(".mp4"):
+                full_path = os.path.join(root, file)
+                file_size = os.path.getsize(full_path)
+                if file_size > 0:  # Check for non-empty files
+                    print(f"Found MP4: {full_path} ({file_size} bytes)")
+                    valid_class_paths.append(full_path)
+                else:
+                    print(f"Skipping empty MP4: {full_path}")
+    
+    print(f"Total valid MP4 files found: {len(valid_class_paths)}")
+    return valid_class_paths
 
 @app.function(volumes={"/root/shared": volume}, timeout=600)
-def combine_segments_improved(segment_paths, output_path):
-    """Combine all rendered segments into a final video using ffmpeg"""
+def concat_videos(video_paths, output_path):
+    """Concatenate multiple videos together using ffmpeg"""
     # Create a temporary directory for intermediate files
     temp_dir = "/tmp/merge_temp"
     os.makedirs(temp_dir, exist_ok=True)
@@ -484,7 +311,7 @@ def combine_segments_improved(segment_paths, output_path):
     # Create a file list for ffmpeg
     concat_file = f"{temp_dir}/concat_list.txt"
     with open(concat_file, "w") as f:
-        for path in segment_paths:
+        for path in video_paths:
             if os.path.exists(path):
                 f.write(f"file '{path}'\n")
     
@@ -495,7 +322,7 @@ def combine_segments_improved(segment_paths, output_path):
     # Make sure output directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
-    # Use ffmpeg to concatenate videos with precise frame handling
+    # Use ffmpeg to concatenate videos
     cmd = f"ffmpeg -f concat -safe 0 -i {concat_file} -c:v libx264 -preset medium -crf 22 {output_path}"
     
     print(f"Running command: {cmd}")
@@ -504,20 +331,78 @@ def combine_segments_improved(segment_paths, output_path):
     success = process.returncode == 0
     
     if success:
-        print(f"Successfully combined segments into: {output_path}")
+        print(f"Successfully combined videos into: {output_path}")
         print(f"Output file size: {os.path.getsize(output_path)} bytes")
     else:
-        print(f"Failed to combine segments: {process.stderr}")
+        print(f"Failed to combine videos: {process.stderr}")
     
     # Return result
     return {
         "success": success,
         "output_file": output_path if success else None,
-        "segments_count": len(segment_paths),
+        "videos_count": len(video_paths),
         "stdout": process.stdout,
         "stderr": process.stderr,
         "command": cmd
     }
+
+@app.function(volumes={"/root/shared": volume})
+def extract_animation_classes(script_path):
+    """Extract the names of all animation classes from the script"""
+    with open(script_path, "r") as f:
+        script_content = f.read()
+    
+    # Set up virtual display for Manim import
+    os.environ["DISPLAY"] = ":1"
+    display_process = subprocess.Popen(["Xvfb", ":1", "-screen", "0", "1920x1080x24"])
+    time.sleep(2)
+    
+    try:
+        # Write a temporary script to extract the classes
+        temp_script_path = "/tmp/extract_classes.py"
+        with open(temp_script_path, "w") as f:
+            f.write(f"""
+import inspect
+import sys
+import json
+from manim import Scene
+
+# Add the directory of the original script to the path
+sys.path.append('{os.path.dirname(script_path)}')
+
+# Import the module (the script)
+module_name = '{os.path.basename(script_path).replace(".py", "")}'
+module = __import__(module_name)
+
+# Find all Scene subclasses
+scene_classes = []
+for name, obj in inspect.getmembers(module):
+    if inspect.isclass(obj) and issubclass(obj, Scene) and obj != Scene:
+        scene_classes.append(name)
+
+# Output as JSON
+print(json.dumps(scene_classes))
+""")
+        
+        # Run the script to extract classes
+        result = subprocess.run(
+            ["python", temp_script_path],
+            capture_output=True, 
+            text=True
+        )
+        
+        if result.returncode != 0:
+            print(f"Error extracting classes: {result.stderr}")
+            # Fallback: Simple regex search for potential class names
+            import re
+            class_matches = re.findall(r'class\s+(\w+)\((?:Scene|.*?Scene)\):', script_content)
+            return class_matches
+        
+        # Parse the JSON output
+        return json.loads(result.stdout)
+    finally:
+        if display_process:
+            display_process.terminate()
 
 @app.function(volumes={"/root/shared": volume})
 def list_output_directory():
@@ -540,18 +425,14 @@ def list_output_directory():
 @app.local_entrypoint()
 def main(
     script_name="binary_search.py",
-    scene_name="SimpleAnimation", 
-    num_segments=6,
+    max_containers=6,
     use_gpu=False
 ):
-    """Main entry point for direct parallel rendering"""
-    
-    num_segments = int(num_segments)
-    
+    """Main entry point for parallel class rendering"""
     if use_gpu:
         os.environ["USE_GPU"] = "1"
     
-    print(f"Starting Direct Parallel Rendering with {'GPU' if use_gpu else 'CPU'}...")
+    print(f"Starting Parallel Class Rendering with {'GPU' if use_gpu else 'CPU'} and max {max_containers} containers...")
     
     script_dir = os.path.dirname(os.path.abspath(__file__))
     local_script_path = os.path.join(script_dir, script_name)
@@ -572,80 +453,66 @@ def main(
         print("ERROR: Failed to upload or locate the script. Exiting.")
         return
     
-    # Get animation metadata
-    print("\n=== Analyzing Animation ===")
-    animation_info = get_animation_metadata(local_script_path, scene_name)
-    total_frames = animation_info["total_frames"]
+    # Extract animation classes from the script
+    print("\n=== Extracting Animation Classes ===")
+    animation_classes = extract_animation_classes.remote(verified_script_path)
     
-    # Add buffer to total frames to ensure we capture everything
-    total_frames = int(total_frames * 1.1)  # Add 10% buffer
-    print(f"Total frames (with buffer): {total_frames}")
+    if not animation_classes:
+        print("ERROR: No animation classes found in the script. Exiting.")
+        return
     
-    # Create segments with overlap between them
-    frames_per_segment = total_frames // num_segments
-    overlap = int(frames_per_segment * 0.1)  # 10% overlap
+    print(f"Found {len(animation_classes)} animation classes:")
+    for cls in animation_classes:
+        print(f"  - {cls}")
     
-    segments = []
-    for i in range(num_segments):
-        # Calculate segment boundaries with overlap
-        start_frame = max(0, i * frames_per_segment - overlap)
-        end_frame = min(total_frames, (i + 1) * frames_per_segment + overlap)
-        
-        segments.append({
-            "segment_id": i,
-            "start_frame": start_frame,
-            "end_frame": end_frame,
-        })
-        print(f"Segment {i}: frames {start_frame} to {end_frame}")
+    # Limit to max_containers if needed
+    if len(animation_classes) > max_containers:
+        print(f"Limiting to {max_containers} containers as specified")
+        animation_classes = animation_classes[:max_containers]
     
-    # Render segments in parallel
-    print("\n=== Rendering Segments in Parallel ===")
+    # Render classes in parallel
+    print("\n=== Rendering Animation Classes in Parallel ===")
     start_time = time.time()
-    segment_results = render_animation_segment.map(
-        [verified_script_path] * num_segments, 
-        [scene_name] * num_segments, 
-        segments
+    class_results = render_animation_class.map(
+        [verified_script_path] * len(animation_classes), 
+        animation_classes
     )
     render_time = time.time() - start_time
     
     # Process results
-    segment_paths = []
-    for result in segment_results:
+    class_paths = []
+    for result in class_results:
         if result["success"]:
-            print(f"Segment {result['segment_id']}: Success ({result['render_time']:.2f}s)")
-            segment_paths.append(result["output_file"])
+            print(f"Class {result['class_name']}: Success ({result['render_time']:.2f}s)")
+            class_paths.append(result["output_file"])
         else:
-            print(f"Segment {result['segment_id']}: Failed")
+            print(f"Class {result['class_name']}: Failed")
     
-    if not segment_paths:
-        print("No segments were rendered successfully. Exiting.")
+    if not class_paths:
+        print("No classes were rendered successfully. Exiting.")
         return
     
-    # Search for the MP4 files in each segment directory
-    print("\n=== Finding Segment Files ===")
-    valid_segment_paths = find_segment_files.remote()
+    # Find all rendered class files
+    print("\n=== Finding Rendered Class Files ===")
+    valid_class_paths = find_class_files.remote()
     
-    if not valid_segment_paths:
-        print("No valid segment files found. Exiting.")
+    if not valid_class_paths:
+        print("No valid class files found. Exiting.")
         return
     
-    # Sort by segment number, ensuring correct order for concatenation
-    valid_segment_paths.sort(key=lambda x: int(''.join(filter(str.isdigit, os.path.basename(x).split('_')[0]))) if ''.join(filter(str.isdigit, os.path.basename(x).split('_')[0])) else 0)
-    
-    print(f"\nFound {len(valid_segment_paths)} valid segments:")
-    for path in valid_segment_paths:
+    print(f"\nFound {len(valid_class_paths)} valid class renderings:")
+    for path in valid_class_paths:
         print(f"  - {path}")
     
-    # Combine segments directly into volume
-    print("\n=== Combining Segments ===")
-    output_filename = f"{scene_name}_combined.mp4"
+    # Concatenate all class videos
+    print("\n=== Concatenating Class Videos ===")
+    output_filename = f"combined_animations.mp4"
     output_path = f"/root/shared/output/{output_filename}"
     
-    # Combine the segments
-    combine_result = combine_segments_improved.remote(valid_segment_paths, output_path)
+    concat_result = concat_videos.remote(valid_class_paths, output_path)
     
-    if combine_result["success"]:
-        print(f"Successfully combined segments into: {combine_result['output_file']}")
+    if concat_result["success"]:
+        print(f"Successfully concatenated videos into: {concat_result['output_file']}")
         
         # List the output directory to confirm the file exists
         output_contents = list_output_directory.remote()
@@ -655,6 +522,6 @@ def main(
             
         print(f"\nRendering complete! Final output is stored in the volume at: {output_path}")
     else:
-        print("Failed to combine segments. Details:")
-        print(f"Command used: {combine_result['command']}")
-        print(f"Error: {combine_result.get('stderr', 'No error details available')}")
+        print("Failed to concatenate videos. Details:")
+        print(f"Command used: {concat_result['command']}")
+        print(f"Error: {concat_result.get('stderr', 'No error details available')}")
