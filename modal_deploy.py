@@ -76,7 +76,7 @@ app = modal.App("manim-multi-class-rendering", image=image)
 # Create a single shared volume for all files
 volume = modal.Volume.from_name("manim-outputs-multi-class", create_if_missing=True)
 
-# Helper function to check for videos and list directories
+# Improved helper function to check for videos and list directories
 def list_directory_contents(path, depth=0, max_depth=3):
     """List contents of a directory recursively up to max_depth"""
     result = []
@@ -97,87 +97,129 @@ def list_directory_contents(path, depth=0, max_depth=3):
     
     return result
 
-# Function to upload a script to the Modal environment
+# Improved function to upload a script to the Modal environment with better verification
 @app.function(volumes={"/root/shared": volume})
 def upload_script(script_content, script_name):
-    """Upload a script to the shared volume with better error handling"""
-    script_path = f"/root/shared/{script_name}"
-    os.makedirs(os.path.dirname(script_path), exist_ok=True)
+    """Upload a script to the shared volume with robust verification"""
+    # Create directory structure if it doesn't exist
+    script_dir = "/root/shared"
+    os.makedirs(script_dir, exist_ok=True)
+    script_path = f"{script_dir}/{script_name}"
     
+    print(f"Writing script to {script_path}...")
+    
+    # Write the script with explicit flush
     with open(script_path, "w") as f:
         f.write(script_content)
+        f.flush()
+        os.fsync(f.fileno())  # Force sync to disk
     
-    # Verify the file was actually written
-    if os.path.exists(script_path):
+    # Verify the file exists and has content
+    if os.path.exists(script_path) and os.path.getsize(script_path) > 0:
         file_size = os.path.getsize(script_path)
-        print(f"Script uploaded to: {script_path} ({file_size} bytes)")
+        print(f"Successfully wrote script to: {script_path} ({file_size} bytes)")
         
-        # For debugging, show the first few lines
+        # For debugging, show the first and last few lines
         with open(script_path, "r") as f:
-            head = "".join(f.readlines()[:5])
-        print(f"File starts with: {head}")
+            lines = f.readlines()
+            head = "".join(lines[:5])
+            tail = "".join(lines[-5:]) if len(lines) > 5 else ""
         
+        print(f"File starts with: {head}")
+        print(f"File ends with: {tail}")
+        
+        # List directory contents to confirm
+        print("Directory contents after writing:")
+        dir_contents = os.listdir(script_dir)
+        for item in dir_contents:
+            item_path = os.path.join(script_dir, item)
+            size = os.path.getsize(item_path) if os.path.isfile(item_path) else "<DIR>"
+            print(f"  - {item} ({size})")
+            
         return script_path
     else:
-        print(f"ERROR: Failed to upload script to {script_path}")
+        print(f"ERROR: Failed to write script to {script_path}")
         return None
 
-# Function to check if a file exists and copy from local if needed
+# Improved function to extract animation classes using script content directly
 @app.function(volumes={"/root/shared": volume})
-def check_and_fix_script_path(script_path):
-    """
-    Check if the script exists in the shared volume and copy from local if needed.
-    Returns the correct path to use.
-    """
-    if os.path.exists(script_path):
-        file_size = os.path.getsize(script_path)
-        print(f"Script found at: {script_path} ({file_size} bytes)")
-        return script_path
+def extract_animation_classes_from_content(script_content, script_name):
+    """Extract animation classes directly from script content to avoid volume sync issues"""
+    print(f"Extracting animation classes from script content for {script_name}")
     
-    # If not found in shared volume, check local directory
-    local_script_path = f"/root/local/{os.path.basename(script_path)}"
-    if os.path.exists(local_script_path):
-        file_size = os.path.getsize(local_script_path)
-        print(f"Script found in local directory: {local_script_path} ({file_size} bytes)")
-        
-        # Copy it to the shared volume for consistency
-        shared_path = f"/root/shared/{os.path.basename(script_path)}"
-        os.makedirs(os.path.dirname(shared_path), exist_ok=True)
-        shutil.copy2(local_script_path, shared_path)
-        print(f"Copied script from {local_script_path} to {shared_path}")
-        
-        # Verify the copy succeeded
-        if os.path.exists(shared_path):
-            print(f"Verified copy exists at {shared_path} ({os.path.getsize(shared_path)} bytes)")
-            return shared_path
-        else:
-            print(f"ERROR: Failed to copy script to {shared_path}")
-            return local_script_path  # Fall back to local path
+    # First save the script to a temporary location
+    temp_script_path = f"/tmp/{script_name}"
+    with open(temp_script_path, "w") as f:
+        f.write(script_content)
     
-    # Neither location has the file
-    print(f"ERROR: Script not found in either location!")
+    # Set up virtual display for Manim import
+    os.environ["DISPLAY"] = ":1"
+    display_process = subprocess.Popen(["Xvfb", ":1", "-screen", "0", "1920x1080x24"])
+    time.sleep(2)
     
-    # List directories to help debug
-    contents = list_directory_contents("/root/shared")
-    print(f"Contents of /root/shared:")
-    for line in contents:
-        print(line)
-    
-    contents = list_directory_contents("/root/local")
-    print(f"Contents of /root/local:")
-    for line in contents:
-        print(line)
-    
-    return None
+    try:
+        # Write an extraction script
+        extract_script_path = "/tmp/extract_classes.py"
+        with open(extract_script_path, "w") as f:
+            f.write(f"""
+import os
+import sys
+import json
+import importlib.util
+from manim import Scene
 
-def generate_class_render_script(original_script_path, class_name):
+# Define the path to the temporary script
+script_path = "{temp_script_path}"
+
+# Load the module dynamically
+spec = importlib.util.spec_from_file_location("dynamic_module", script_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules["dynamic_module"] = module
+spec.loader.exec_module(module)
+
+# Find all Scene subclasses
+scene_classes = []
+for name in dir(module):
+    obj = getattr(module, name)
+    try:
+        if isinstance(obj, type) and issubclass(obj, Scene) and obj != Scene:
+            scene_classes.append(name)
+    except TypeError:
+        # This happens when obj is not a class
+        pass
+
+# Output as JSON
+print(json.dumps(scene_classes))
+""")
+        
+        # Execute the extraction script
+        result = subprocess.run(
+            ["python", extract_script_path],
+            capture_output=True, 
+            text=True
+        )
+        
+        if result.returncode != 0:
+            print(f"Error extracting classes: {result.stderr}")
+            # Fallback: Simple regex search for potential class names
+            import re
+            class_matches = re.findall(r'class\s+(\w+)\((?:Scene|.*?Scene)\):', script_content)
+            print(f"Using regex fallback, found classes: {class_matches}")
+            return class_matches
+        
+        # Parse the JSON output
+        classes = json.loads(result.stdout)
+        print(f"Successfully extracted {len(classes)} animation classes: {classes}")
+        return classes
+    finally:
+        if display_process:
+            display_process.terminate()
+
+def generate_class_render_script(script_content, class_name):
     """
     Generate a modified Manim script that will only render a specific animation class.
+    Works with script content directly rather than a file path.
     """
-    # Read the original script
-    with open(original_script_path, "r") as f:
-        script_content = f.read()
-    
     # Create a class-specific script
     class_script = f"""
 # Modified script to render only the {class_name} class
@@ -209,8 +251,8 @@ if __name__ == "__main__":
     cpu=4 if os.environ.get("USE_GPU", "0") == "0" else 2,
     memory=8192 if os.environ.get("USE_GPU", "0") == "0" else 4096,
 )
-def render_animation_class(script_path, class_name):
-    """Render a specific animation class using Manim"""
+def render_animation_class(script_content, class_name):
+    """Render a specific animation class using Manim, taking script content directly"""
     # Set up environment variables based on hardware
     has_gpu = os.environ.get("MODAL_CONTAINER_GPU_COUNT", "0") != "0"
     env_vars = gpu_env if has_gpu else cpu_env
@@ -228,8 +270,19 @@ def render_animation_class(script_path, class_name):
     
     try:
         # Generate a modified script for this class
-        class_script_path = generate_class_render_script(script_path, class_name)
+        class_script_path = generate_class_render_script(script_content, class_name)
         print(f"Generated class script at: {class_script_path}")
+        
+        # Verify the script was created correctly
+        if os.path.exists(class_script_path):
+            print(f"Class script exists: {class_script_path} ({os.path.getsize(class_script_path)} bytes)")
+        else:
+            print(f"ERROR: Class script not found at {class_script_path}")
+            return {
+                "class_name": class_name,
+                "success": False,
+                "error": "Failed to create class render script"
+            }
         
         # Render the class
         start_time = time.time()
@@ -240,6 +293,7 @@ def render_animation_class(script_path, class_name):
         print(f"Running command: {cmd}")
         
         process = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        print(f"Command exit code: {process.returncode}")
         print(f"Stdout: {process.stdout}")
         print(f"Stderr: {process.stderr}")
         
@@ -251,16 +305,25 @@ def render_animation_class(script_path, class_name):
         
         for search_dir in search_dirs:
             if os.path.exists(search_dir):
+                print(f"Searching for MP4 files in {search_dir}")
                 for root, dirs, files in os.walk(search_dir):
                     for file in files:
                         if file.endswith(".mp4") and class_name in file:
-                            found_mp4_files.append(os.path.join(root, file))
+                            mp4_path = os.path.join(root, file)
+                            found_mp4_files.append(mp4_path)
+                            print(f"Found MP4: {mp4_path} ({os.path.getsize(mp4_path)} bytes)")
         
         if found_mp4_files:
             # Copy to output location
             class_output_path = os.path.join(output_dir, f"{class_name}.mp4")
             shutil.copy2(found_mp4_files[0], class_output_path)
             print(f"Copied {class_name} to {class_output_path}")
+            
+            # Verify the copy succeeded
+            if os.path.exists(class_output_path) and os.path.getsize(class_output_path) > 0:
+                print(f"Verified output file: {class_output_path} ({os.path.getsize(class_output_path)} bytes)")
+            else:
+                print(f"WARNING: Copy verification failed for {class_output_path}")
             
             return {
                 "class_name": class_name,
@@ -373,64 +436,6 @@ def concat_videos(video_paths, output_path):
     }
 
 @app.function(volumes={"/root/shared": volume})
-def extract_animation_classes(script_path):
-    """Extract the names of all animation classes from the script"""
-    with open(script_path, "r") as f:
-        script_content = f.read()
-    
-    # Set up virtual display for Manim import
-    os.environ["DISPLAY"] = ":1"
-    display_process = subprocess.Popen(["Xvfb", ":1", "-screen", "0", "1920x1080x24"])
-    time.sleep(2)
-    
-    try:
-        # Write a temporary script to extract the classes
-        temp_script_path = "/tmp/extract_classes.py"
-        with open(temp_script_path, "w") as f:
-            f.write(f"""
-import inspect
-import sys
-import json
-from manim import Scene
-
-# Add the directory of the original script to the path
-sys.path.append('{os.path.dirname(script_path)}')
-
-# Import the module (the script)
-module_name = '{os.path.basename(script_path).replace(".py", "")}'
-module = __import__(module_name)
-
-# Find all Scene subclasses
-scene_classes = []
-for name, obj in inspect.getmembers(module):
-    if inspect.isclass(obj) and issubclass(obj, Scene) and obj != Scene:
-        scene_classes.append(name)
-
-# Output as JSON
-print(json.dumps(scene_classes))
-""")
-        
-        # Run the script to extract classes
-        result = subprocess.run(
-            ["python", temp_script_path],
-            capture_output=True, 
-            text=True
-        )
-        
-        if result.returncode != 0:
-            print(f"Error extracting classes: {result.stderr}")
-            # Fallback: Simple regex search for potential class names
-            import re
-            class_matches = re.findall(r'class\s+(\w+)\((?:Scene|.*?Scene)\):', script_content)
-            return class_matches
-        
-        # Parse the JSON output
-        return json.loads(result.stdout)
-    finally:
-        if display_process:
-            display_process.terminate()
-
-@app.function(volumes={"/root/shared": volume})
 def list_output_directory():
     output_dir = "/root/shared/output"
     result = []
@@ -475,29 +480,21 @@ def main(
         print(f"Error: Script {local_script_path} not found!")
         return
     
-    # Upload the script to Modal
-    print(f"\n=== Uploading Script {script_name} ===")
+    # Read script content once
+    print(f"\n=== Reading Local Script {script_name} ===")
     with open(local_script_path, "r") as f:
         script_content = f.read()
     
+    script_size = len(script_content)
+    print(f"Successfully read script: {local_script_path} ({script_size} bytes)")
+    
+    # Upload the script to Modal (for future use, but we'll primarily use content directly)
+    print(f"\n=== Uploading Script {script_name} to Volume ===")
     remote_script_path = upload_script.remote(script_content, script_name)
     
-    if not remote_script_path:
-        print("ERROR: Failed to upload script. Trying alternative approach...")
-        # Directly copy from local path
-        alt_path = f"/root/shared/{script_name}"
-        print(f"Copying {local_script_path} to {alt_path} directly...")
-        remote_script_path = alt_path
-    
-    verified_script_path = check_and_fix_script_path.remote(remote_script_path)
-    
-    if not verified_script_path:
-        print("ERROR: Failed to upload or locate the script. Exiting.")
-        return
-    
-    # Extract animation classes from the script
+    # Extract animation classes directly from content
     print("\n=== Extracting Animation Classes ===")
-    animation_classes = extract_animation_classes.remote(verified_script_path)
+    animation_classes = extract_animation_classes_from_content.remote(script_content, script_name)
     
     if not animation_classes:
         print("ERROR: No animation classes found in the script. Exiting.")
@@ -512,11 +509,11 @@ def main(
         print(f"Limiting to {max_containers} containers as specified")
         animation_classes = animation_classes[:max_containers]
     
-    # Render classes in parallel
+    # Render classes in parallel - passing script content directly
     print("\n=== Rendering Animation Classes in Parallel ===")
     render_start_time = time.time()
     class_results = render_animation_class.map(
-        [verified_script_path] * len(animation_classes), 
+        [script_content] * len(animation_classes), 
         animation_classes
     )
     render_time = time.time() - render_start_time
