@@ -5,6 +5,7 @@ import time
 import shutil
 from pathlib import Path
 import json
+import datetime
 
 # Define environment variables
 gpu_env = {
@@ -129,13 +130,15 @@ def check_and_fix_script_path(script_path):
     Returns the correct path to use.
     """
     if os.path.exists(script_path):
-        print(f"Script found at: {script_path}")
+        file_size = os.path.getsize(script_path)
+        print(f"Script found at: {script_path} ({file_size} bytes)")
         return script_path
     
     # If not found in shared volume, check local directory
     local_script_path = f"/root/local/{os.path.basename(script_path)}"
     if os.path.exists(local_script_path):
-        print(f"Script found in local directory: {local_script_path}")
+        file_size = os.path.getsize(local_script_path)
+        print(f"Script found in local directory: {local_script_path} ({file_size} bytes)")
         
         # Copy it to the shared volume for consistency
         shared_path = f"/root/shared/{os.path.basename(script_path)}"
@@ -143,7 +146,13 @@ def check_and_fix_script_path(script_path):
         shutil.copy2(local_script_path, shared_path)
         print(f"Copied script from {local_script_path} to {shared_path}")
         
-        return shared_path
+        # Verify the copy succeeded
+        if os.path.exists(shared_path):
+            print(f"Verified copy exists at {shared_path} ({os.path.getsize(shared_path)} bytes)")
+            return shared_path
+        else:
+            print(f"ERROR: Failed to copy script to {shared_path}")
+            return local_script_path  # Fall back to local path
     
     # Neither location has the file
     print(f"ERROR: Script not found in either location!")
@@ -308,16 +317,33 @@ def concat_videos(video_paths, output_path):
     temp_dir = "/tmp/merge_temp"
     os.makedirs(temp_dir, exist_ok=True)
     
+    # Verify all input files exist and have content
+    valid_paths = []
+    print(f"Validating {len(video_paths)} video paths...")
+    for path in video_paths:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            valid_paths.append(path)
+            print(f"Valid file: {path} ({os.path.getsize(path)} bytes)")
+        else:
+            print(f"Warning: Invalid or empty file: {path}")
+    
+    if not valid_paths:
+        print("No valid video files to concatenate!")
+        return {
+            "success": False,
+            "error": "No valid video files found"
+        }
+    
     # Create a file list for ffmpeg
     concat_file = f"{temp_dir}/concat_list.txt"
     with open(concat_file, "w") as f:
-        for path in video_paths:
-            if os.path.exists(path):
-                f.write(f"file '{path}'\n")
+        for path in valid_paths:
+            f.write(f"file '{path}'\n")
     
     # Verify concat file contents
     with open(concat_file, "r") as f:
-        print(f"Concat file contents:\n{f.read()}")
+        concat_content = f.read()
+        print(f"Concat file contents:\n{concat_content}")
     
     # Make sure output directory exists
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -340,7 +366,7 @@ def concat_videos(video_paths, output_path):
     return {
         "success": success,
         "output_file": output_path if success else None,
-        "videos_count": len(video_paths),
+        "videos_count": len(valid_paths),
         "stdout": process.stdout,
         "stderr": process.stderr,
         "command": cmd
@@ -410,13 +436,17 @@ def list_output_directory():
     result = []
     
     if os.path.exists(output_dir):
-        for item in os.listdir(output_dir):
-            full_path = os.path.join(output_dir, item)
-            if os.path.isdir(full_path):
-                result.append(f"[DIR] {item}")
+        for root, dirs, files in os.walk(output_dir):
+            rel_path = os.path.relpath(root, output_dir)
+            if rel_path == ".":
+                prefix = ""
             else:
+                prefix = rel_path + "/"
+                
+            for file in files:
+                full_path = os.path.join(root, file)
                 size = os.path.getsize(full_path)
-                result.append(f"[{size} bytes] {item}")
+                result.append(f"{prefix}{file} ({size} bytes)")
     else:
         result.append(f"Directory does not exist: {output_dir}")
     
@@ -428,11 +458,15 @@ def main(
     max_containers=6,
     use_gpu=False
 ):
-    """Main entry point for parallel class rendering"""
+    """Main entry point for parallel class rendering with improved robustness"""
     if use_gpu:
         os.environ["USE_GPU"] = "1"
     
+    # Record start time for total time calculation
+    total_start_time = time.time()
+    
     print(f"Starting Parallel Class Rendering with {'GPU' if use_gpu else 'CPU'} and max {max_containers} containers...")
+    print(f"Start time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     script_dir = os.path.dirname(os.path.abspath(__file__))
     local_script_path = os.path.join(script_dir, script_name)
@@ -447,6 +481,14 @@ def main(
         script_content = f.read()
     
     remote_script_path = upload_script.remote(script_content, script_name)
+    
+    if not remote_script_path:
+        print("ERROR: Failed to upload script. Trying alternative approach...")
+        # Directly copy from local path
+        alt_path = f"/root/shared/{script_name}"
+        print(f"Copying {local_script_path} to {alt_path} directly...")
+        remote_script_path = alt_path
+    
     verified_script_path = check_and_fix_script_path.remote(remote_script_path)
     
     if not verified_script_path:
@@ -472,47 +514,77 @@ def main(
     
     # Render classes in parallel
     print("\n=== Rendering Animation Classes in Parallel ===")
-    start_time = time.time()
+    render_start_time = time.time()
     class_results = render_animation_class.map(
         [verified_script_path] * len(animation_classes), 
         animation_classes
     )
-    render_time = time.time() - start_time
+    render_time = time.time() - render_start_time
     
     # Process results
+    successful_renders = 0
     class_paths = []
+    total_class_render_time = 0
+    
     for result in class_results:
         if result["success"]:
+            successful_renders += 1
             print(f"Class {result['class_name']}: Success ({result['render_time']:.2f}s)")
             class_paths.append(result["output_file"])
+            total_class_render_time += result["render_time"]
         else:
             print(f"Class {result['class_name']}: Failed")
     
-    if not class_paths:
+    if not successful_renders:
         print("No classes were rendered successfully. Exiting.")
+        total_time = time.time() - total_start_time
+        print(f"\nTotal execution time: {total_time:.2f} seconds")
         return
     
-    # Find all rendered class files
-    print("\n=== Finding Rendered Class Files ===")
+    # Calculate average render time per class
+    avg_render_time = total_class_render_time / successful_renders if successful_renders > 0 else 0
+    print(f"\nRendering statistics:")
+    print(f"  - Successful renders: {successful_renders}/{len(animation_classes)}")
+    print(f"  - Total parallel render time: {render_time:.2f} seconds")
+    print(f"  - Average render time per class: {avg_render_time:.2f} seconds")
+    print(f"  - Total cumulative render time: {total_class_render_time:.2f} seconds")
+    print(f"  - Parallel speedup factor: {total_class_render_time/render_time if render_time > 0 else 0:.2f}x")
+    
+    # Find all rendered class files with improved search
+    print("\n=== Finding All Rendered Class Files ===")
     valid_class_paths = find_class_files.remote()
     
     if not valid_class_paths:
-        print("No valid class files found. Exiting.")
+        print("No valid class files found. Check if any rendering was successful.")
+        # List all contents of the volume for debugging
+        output_contents = list_output_directory.remote()
+        print("\n=== Output Directory Contents ===")
+        for line in output_contents:
+            print(line)
+        
+        total_time = time.time() - total_start_time
+        print(f"\nTotal execution time: {total_time:.2f} seconds")
         return
     
     print(f"\nFound {len(valid_class_paths)} valid class renderings:")
     for path in valid_class_paths:
         print(f"  - {path}")
     
+    # Sort the paths to ensure consistent ordering
+    valid_class_paths.sort()
+    
     # Concatenate all class videos
     print("\n=== Concatenating Class Videos ===")
+    concat_start_time = time.time()
     output_filename = f"combined_animations.mp4"
     output_path = f"/root/shared/output/{output_filename}"
     
     concat_result = concat_videos.remote(valid_class_paths, output_path)
+    concat_time = time.time() - concat_start_time
     
     if concat_result["success"]:
-        print(f"Successfully concatenated videos into: {concat_result['output_file']}")
+        print(f"Successfully concatenated {concat_result['videos_count']} videos into: {concat_result['output_file']}")
+        print(f"Concatenation time: {concat_time:.2f} seconds")
         
         # List the output directory to confirm the file exists
         output_contents = list_output_directory.remote()
@@ -520,8 +592,14 @@ def main(
         for line in output_contents:
             print(line)
             
+        total_time = time.time() - total_start_time
         print(f"\nRendering complete! Final output is stored in the volume at: {output_path}")
+        print(f"Total execution time: {total_time:.2f} seconds")
+        print(f"End time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     else:
         print("Failed to concatenate videos. Details:")
         print(f"Command used: {concat_result['command']}")
         print(f"Error: {concat_result.get('stderr', 'No error details available')}")
+        
+        total_time = time.time() - total_start_time
+        print(f"\nTotal execution time: {total_time:.2f} seconds (process failed)")
