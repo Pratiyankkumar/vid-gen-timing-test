@@ -1,6 +1,3 @@
-import patch_moderngl
-import patch_manim_camera
-
 from manimlib import *
 import numpy as np
 

@@ -4,36 +4,40 @@ import subprocess
 import time
 import shutil
 
-# GPU environment variables
 gpu_env = {
-    "PYOPENGL_PLATFORM": "egl",
+    "PYOPENGL_PLATFORM": "glx",
     "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
     "__NV_PRIME_RENDER_OFFLOAD": "1",
-    "LIBGL_ALWAYS_SOFTWARE": "1",
     "__GL_SYNC_TO_VBLANK": "0",
     "DISPLAY": ":1",
-    "MODERNGL_WINDOW":"egl",
-    "XDG_RUNTIME_DIR": "/tmp/runtime-root"
+    "MODERNGL_WINDOW":"glx",
 }
 
-# Create container image
+init_commands = [
+    "export DEBIAN_FRONTEND=noninteractive",
+    "echo 'keyboard-configuration keyboard-configuration/layout select English (US)' | debconf-set-selections",
+    "echo 'keyboard-configuration keyboard-configuration/variant select English (US)' | debconf-set-selections",
+    "ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime",
+    "apt-get update && apt-get install -y tzdata",
+    "dpkg-reconfigure --frontend noninteractive tzdata",
+    "apt-get update && apt-get install -y software-properties-common wget apt-utils",
+    "add-apt-repository -y ppa:graphics-drivers/ppa",
+    "apt-get update",
+]
+
 image = (
-    modal.Image.from_registry("robopaas/cudagl:12.2.0-devel-ubuntu22.04", add_python="3.11")
-    .run_commands(
-        "export DEBIAN_FRONTEND=noninteractive",
-        "ln -fs /usr/share/zoneinfo/Etc/UTC /etc/localtime",
-        "apt-get update && apt-get install -y tzdata",
-        "dpkg-reconfigure --frontend noninteractive tzdata",
-    )
+    modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.10")
+    .run_commands(*init_commands)
     .apt_install(
         "build-essential",
         "clang",
         "pkg-config",
         "python3-dev",
+        "xserver-xorg-video-dummy",
+        "xvfb",
         "ffmpeg",
         "sox",
         "libsox-fmt-all",
-        "xvfb",
         "x11-utils",
         "mesa-utils",
         "libegl1-mesa-dev",
@@ -53,6 +57,8 @@ image = (
         "texlive-latex-recommended",
         "texlive-science",
         "texlive-fonts-recommended",
+        "libxrender1",
+        "libxext6",
     )
     .run_commands(
         "mkdir -p /etc/OpenCL/vendors && echo \"libnvidia-opencl.so.1\" > /etc/OpenCL/vendors/nvidia.icd",
@@ -82,9 +88,32 @@ image = (
     .add_local_dir(".", remote_path="/root/local")
 )
 
-app = modal.App("manimgl-gpu", image=image)
+app = modal.App("manim-opengl", image=image)
 volume = modal.Volume.from_name("manim-opengl", create_if_missing=True)
 
+def create_xorg_conf():
+    with open('/etc/X11/xorg.conf', 'w') as f:
+        f.write('Section "ServerLayout"\n')
+        f.write('    Identifier "Layout0"\n')
+        f.write('    Screen 0 "Screen0" 0 0\n')
+        f.write('EndSection\n\n')
+
+        f.write('Section "Device"\n')
+        f.write('    Identifier "Device0"\n')
+        f.write('    Driver "nvidia"\n')
+        f.write('    Option "AllowEmptyInitialConfiguration" "True"\n')
+        f.write('EndSection\n\n')
+
+        f.write('Section "Screen"\n')
+        f.write('    Identifier "Screen0"\n')
+        f.write('    Device "Device0"\n')
+        f.write('    DefaultDepth 24\n')
+        f.write('    Option "UseDisplayDevice" "None"\n')
+        f.write('    SubSection "Display"\n')
+        f.write('        Depth 24\n')
+        f.write('        Virtual 1920 1080\n')
+        f.write('    EndSubSection\n')
+        f.write('EndSection\n')
 
 @app.function(
     gpu="A10G",
@@ -92,53 +121,58 @@ volume = modal.Volume.from_name("manim-opengl", create_if_missing=True)
     timeout=1800,
 )
 def render_manim_gpu(scene_name="SimpleAnimation"):
-    os.environ["PYTHONPATH"] = "/root/local"
-    print(subprocess.getoutput("eglinfo || true"))
     for key, value in gpu_env.items():
         os.environ[key] = value
 
-    print("GPU Environment Diagnostics:")
-    print(f"LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH')}")
-    print(f"PYOPENGL_PLATFORM: {os.environ.get('PYOPENGL_PLATFORM')}")
-
     output_path = "/root/output/gpu"
+    if os.path.exists(output_path):
+        shutil.rmtree(output_path)
     os.makedirs(output_path, exist_ok=True)
+    create_xorg_conf()
+    subprocess.run(["chmod", "777", "/etc/X11/xorg.conf"])
+    import threading
+    stop_monitoring = threading.Event()
+
+    def monitor_gpu():
+        while not stop_monitoring.is_set():
+            subprocess.run(["nvidia-smi"])
+            time.sleep(5)
+
+    monitor_thread = threading.Thread(target=monitor_gpu)
+    monitor_thread.daemon = True
+    monitor_thread.start()
 
     display_process = subprocess.Popen([
-        "Xvfb", ":1",
-        "-screen", "0", "1280x720x24",
-        "+extension", "GLX",
-        "+render",
-        "-ac"
+        "Xorg", "-noreset", "+extension", "GLX",
+        "-logfile", "/tmp/xorg.log", "-config", "/etc/X11/xorg.conf",
+        ":1"
     ])
+    time.sleep(5)
 
-    time.sleep(2)
     print("Running on GPU...")
-
-    subprocess.check_call(["xdpyinfo", "-display", ":1"], stdout=subprocess.DEVNULL)
-    print("Virtual display running properly")
+    subprocess.run(["xdpyinfo", "-display", ":1"])
+    print("Display :1 is available")
 
     start_time = time.time()
+
     cmd = "cd /root/local && "
     for key, value in gpu_env.items():
         cmd += f"{key}={value} "
-    cmd = (
-        "cd /root/local && "
-        "PYOPENGL_PLATFORM=egl manimgl binary_search_manimgl.py "
-        f"{scene_name} -o"
-    )
-    print(f"Running command on GPU: {cmd}")
-    process = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=os.environ)
-    print(f"Exit code: {process.returncode}")
-    print(f"STDOUT: {process.stdout}")
-    print(f"STDERR: {process.stderr}")
+
+    direct_cmd = cmd + f"manimgl binary_search_manimgl.py {scene_name} -o"
+    print(f"Running command on GPU: {direct_cmd}")
+    process = subprocess.run(direct_cmd, shell=True, capture_output=True, text=True, env=os.environ)
     elapsed_time = time.time() - start_time
+    stop_monitoring.set()
+    monitor_thread.join(timeout=1)
 
     display_process.terminate()
+    subprocess.run("sync", shell=True)
 
     found_mp4_files = []
     search_dirs = [
         "/root/local/videos",
+        "/root/output/gpu"
     ]
 
     for search_dir in search_dirs:
@@ -156,28 +190,38 @@ def render_manim_gpu(scene_name="SimpleAnimation"):
             "elapsed_time": elapsed_time,
             "output_files": [],
             "exit_code": process.returncode,
+            "stdout": process.stdout,
+            "stderr": process.stderr
         }
 
     output_files = []
 
-    for src_path in found_mp4_files:
-        dst_filename = f"{scene_name}_GPU.mp4"
-        dst_path = os.path.join(output_path, dst_filename)
+    dst_filename = f"{scene_name}_GPU.mp4"
+    dst_path = os.path.join(output_path, dst_filename)
 
-        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    if os.path.exists(dst_path):
+        os.remove(dst_path)
 
+    if found_mp4_files:
+        src_path = found_mp4_files[0]
         print(f"Copying {src_path} to {dst_path}")
         shutil.copy2(src_path, dst_path)
-        print(f"Copied output file to {dst_path}")
+        subprocess.run("sync", shell=True)
 
         size_bytes = os.path.getsize(dst_path)
-        output_files.append({"path": dst_filename, "size": size_bytes, "full_path": dst_path})
+        output_files.append({
+            "path": dst_filename,
+            "size": size_bytes,
+            "full_path": dst_path
+        })
 
     return {
         "device": "GPU",
         "elapsed_time": elapsed_time,
         "output_files": output_files,
         "exit_code": process.returncode,
+        "stdout": process.stdout,
+        "stderr": process.stderr
     }
 
 
@@ -190,46 +234,53 @@ def render_manim_gpu(scene_name="SimpleAnimation"):
 def render_manim_cpu(scene_name="SimpleAnimation"):
     cpu_env = {
         "MANIMGL_MULTIPROCESSING": "1",
-        "DISPLAY": ":1"
+        "DISPLAY": ":1",
+        "PYOPENGL_PLATFORM": "glx",
     }
 
     for key, value in cpu_env.items():
         os.environ[key] = value
 
-    print("CPU Environment Diagnostics:")
-    print(f"MANIMGL_MULTIPROCESSING: {os.environ.get('MANIMGL_MULTIPROCESSING')}")
-    print(f"LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH')}")
-
     output_path = "/root/output/cpu"
+    if os.path.exists(output_path):
+        shutil.rmtree(output_path)
     os.makedirs(output_path, exist_ok=True)
 
-    print("Running on CPU...")
-    display_process = subprocess.Popen([
-        "Xvfb", ":1",
-        "-screen", "0", "1280x720x24",
-        "+extension", "GLX",
-        "+render",
-        "-ac"
-    ])
-    time.sleep(2)
+    create_xorg_conf()
 
-    print("✅ [Patch] Forcing standalone EGL context")
+    print("Running on CPU...")
+
+    display_process = subprocess.Popen([
+        "Xorg", "-noreset",
+        "-config", "/etc/X11/xorg.conf",
+        "-logfile", "/tmp/xorg_cpu.log",
+        ":1"
+    ])
+    time.sleep(5)
+
+    subprocess.run(["xdpyinfo", "-display", ":1"])
+    print("Display :1 is available")
+
     start_time = time.time()
+
     cmd = "cd /root/local && "
-    for key, value in gpu_env.items():
+    for key, value in cpu_env.items():
         cmd += f"{key}={value} "
-    cmd += f"PYTHONPATH=/root/local python3 -c 'import patch_manim_camera' && manimgl binary_search_manimgl.py {scene_name} -o"
+    cmd += f"manimgl binary_search_manimgl.py {scene_name} -o"
+
     print(f"Running command on CPU: {cmd}")
     process = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=os.environ)
-    print(f"Exit code: {process.returncode}")
     elapsed_time = time.time() - start_time
 
     display_process.terminate()
+    subprocess.run("sync", shell=True)
 
     found_mp4_files = []
     search_dirs = [
         "/root/local/videos",
+        "/root/output/cpu"
     ]
+
     for search_dir in search_dirs:
         if os.path.exists(search_dir):
             for root, dirs, files in os.walk(search_dir):
@@ -245,73 +296,62 @@ def render_manim_cpu(scene_name="SimpleAnimation"):
             "elapsed_time": elapsed_time,
             "output_files": [],
             "exit_code": process.returncode,
+            "stdout": process.stdout,
+            "stderr": process.stderr
         }
 
     output_files = []
 
-    for src_path in found_mp4_files:
-        dst_filename = f"{scene_name}_CPU.mp4"
-        dst_path = os.path.join(output_path, dst_filename)
+    dst_filename = f"{scene_name}_CPU.mp4"
+    dst_path = os.path.join(output_path, dst_filename)
 
-        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    if os.path.exists(dst_path):
+        os.remove(dst_path)
 
+    if found_mp4_files:
+        src_path = found_mp4_files[0]
         print(f"Copying {src_path} to {dst_path}")
         shutil.copy2(src_path, dst_path)
-        print(f"Copied output file to {dst_path}")
+        subprocess.run("sync", shell=True)
 
         size_bytes = os.path.getsize(dst_path)
-        output_files.append({"path": dst_filename, "size": size_bytes, "full_path": dst_path})
+        output_files.append({
+            "path": dst_filename,
+            "size": size_bytes,
+            "full_path": dst_path
+        })
 
     return {
         "device": "CPU",
         "elapsed_time": elapsed_time,
         "output_files": output_files,
         "exit_code": process.returncode,
+        "stdout": process.stdout,
+        "stderr": process.stderr
     }
 
 
 @app.function(
     volumes={"/root/output": volume},
 )
-def download_file(file_path):
-    print(f"Attempting to download {file_path}")
+def sync_volume():
+    print("Syncing volume...")
+    subprocess.run("sync", shell=True)
+    return True
 
+
+@app.function(
+    volumes={"/root/output": volume},
+)
+def download_file(file_path):
+    print(f"Downloading {file_path}")
     if os.path.exists(file_path):
-        print(f"File exists: size = {os.path.getsize(file_path)} bytes")
         with open(file_path, "rb") as f:
             content = f.read()
             print(f"Read {len(content)} bytes")
             return content
 
-    # File not found, try to find an alternative file
-    parent_dir = os.path.dirname(file_path)
-    filename = os.path.basename(file_path)
-
-    print(f"Error: File {file_path} not found")
-
-    # Search in possible locations
-    search_dirs = [
-        "/root/output/gpu",
-        "/root/output/cpu",
-        "/root/local",
-        "/root/local/videos",
-        "/root/local/media/videos"
-    ]
-
-    for search_dir in search_dirs:
-        if os.path.exists(search_dir):
-            print(f"Checking directory: {search_dir}")
-            for item in os.listdir(search_dir):
-                item_path = os.path.join(search_dir, item)
-                if os.path.isfile(item_path) and item.endswith(".mp4"):
-                    print(f"Found possible alternative file: {item_path}")
-                    with open(item_path, "rb") as f:
-                        content = f.read()
-                        print(f"Using alternative file, read {len(content)} bytes")
-                        return content
-
-    # Return empty content if no file found
-    print("No usable file found, returning empty content")
+    print(f"File {file_path} not found")
     return b""
 
 
@@ -326,6 +366,15 @@ def main():
         shutil.rmtree(local_output_dir)
 
     os.makedirs(local_output_dir, exist_ok=True)
+    if os.path.exists(os.path.join(local_output_dir, "gpu")):
+        shutil.rmtree(os.path.join(local_output_dir, "gpu"))
+    if os.path.exists(os.path.join(local_output_dir, "cpu")):
+        shutil.rmtree(os.path.join(local_output_dir, "cpu"))
+
+    videos_dir = "/root/local/videos"
+    if os.path.exists(videos_dir):
+        shutil.rmtree(videos_dir)
+
     os.makedirs(os.path.join(local_output_dir, "gpu"), exist_ok=True)
     os.makedirs(os.path.join(local_output_dir, "cpu"), exist_ok=True)
 
@@ -335,7 +384,9 @@ def main():
     gpu_total_time = time.time() - gpu_start_time
     print(f"GPU total execution time: {gpu_total_time:.2f} seconds")
     print(f"GPU rendering time: {gpu_result['elapsed_time']:.2f} seconds")
-    print(f"Exit code: {gpu_result['exit_code']}")
+    print("===============GPU Result===============")
+    print(gpu_result)
+
     print(f"Generated {len(gpu_result['output_files'])} output files")
     for file_info in gpu_result["output_files"]:
         print(f"- {file_info['path']} ({file_info['size'] / 1024 / 1024:.2f} MB)")
@@ -346,7 +397,8 @@ def main():
     cpu_total_time = time.time() - cpu_start_time
     print(f"CPU total execution time: {cpu_total_time:.2f} seconds")
     print(f"CPU rendering time: {cpu_result['elapsed_time']:.2f} seconds")
-    print(f"Exit code: {cpu_result['exit_code']}")
+    print("===============CPU Result===============")
+    print(cpu_result)
     print(f"Generated {len(cpu_result['output_files'])} output files")
     for file_info in cpu_result["output_files"]:
         print(f"- {file_info['path']} ({file_info['size'] / 1024 / 1024:.2f} MB)")
@@ -367,18 +419,16 @@ def main():
         else:
             print("Invalid GPU rendering time (0 or negative)")
 
+        print("\n=== Syncing files to volume ===")
+        sync_volume.remote()
+
         print("\n=== Downloading files to local machine ===")
 
-        # Download GPU files
         print("Downloading GPU files...")
-        gpu_output_path = "/root/output/gpu"
         for file_info in gpu_result["output_files"]:
-            file_path = os.path.join(gpu_output_path, file_info["path"])
+            file_path = file_info["full_path"]
             local_path = os.path.join(local_output_dir, "gpu", file_info["path"])
-
-            print(f"Downloading {file_path}...")
             content = download_file.remote(file_path)
-
             if content:
                 with open(local_path, "wb") as f:
                     f.write(content)
@@ -386,16 +436,11 @@ def main():
             else:
                 print(f"Failed to download {file_path}")
 
-        # Download CPU files
         print("Downloading CPU files...")
-        cpu_output_path = "/root/output/cpu"
         for file_info in cpu_result["output_files"]:
-            file_path = os.path.join(cpu_output_path, file_info["path"])
+            file_path = file_info["full_path"]
             local_path = os.path.join(local_output_dir, "cpu", file_info["path"])
-
-            print(f"Downloading {file_path}...")
             content = download_file.remote(file_path)
-
             if content:
                 with open(local_path, "wb") as f:
                     f.write(content)
